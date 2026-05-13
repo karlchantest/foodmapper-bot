@@ -1,23 +1,22 @@
 import os
 import re
 import httpx
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    ConversationHandler, filters, ContextTypes
+    ConversationHandler, CallbackQueryHandler, filters, ContextTypes
 )
 from supabase import create_client
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN       = os.environ.get("BOT_TOKEN")
-SUPABASE_URL    = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY    = os.environ.get("SUPABASE_KEY")
-GOOGLE_API_KEY  = os.environ.get("GOOGLE_API_KEY")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Conversation states ───────────────────────────────────────────────────────
-WAITING_NAME, WAITING_AREA = range(2)
+# ── States ────────────────────────────────────────────────────────────────────
+WAITING_NAME, WAITING_SELECTION = range(2)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def extract_ig_url(text: str):
@@ -25,19 +24,20 @@ def extract_ig_url(text: str):
     match = re.search(pattern, text)
     return match.group(0) if match else None
 
-async def geocode(query: str):
-    """Returns (lat, lng, formatted_address) or None."""
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": query, "key": GOOGLE_API_KEY}
+async def search_places(name: str):
+    """Search restaurants via Nominatim — no API key needed."""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": f"{name} Vancouver BC Canada",
+        "format": "json",
+        "limit": 4,
+        "addressdetails": 1,
+    }
+    headers = {"User-Agent": "FoodMapperBot/1.0"}
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params)
-        data = resp.json()
-    print(f"Geocode query: {query} | status: {data.get('status')}")
-    if data.get("status") == "OK":
-        result = data["results"][0]
-        loc = result["geometry"]["location"]
-        return loc["lat"], loc["lng"], result["formatted_address"]
-    return None
+        resp = await client.get(url, params=params, headers=headers)
+        results = resp.json()
+    return results
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -60,7 +60,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['ig_url']  = ig_url
     context.user_data['user_id'] = update.effective_user.id
-
     await update.message.reply_text("呢間叫咩名？")
     return WAITING_NAME
 
@@ -70,64 +69,66 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("俾個名我 😅")
         return WAITING_NAME
 
-    context.user_data['name'] = name
+    await update.message.reply_text("⏳ 搵緊...")
+    results = await search_places(name)
+
+    if not results:
+        await update.message.reply_text(
+            "🤔 搵唔到呢間餐廳。\n試吓改吓名再試，或者用英文。"
+        )
+        return WAITING_NAME
+
+    context.user_data['places'] = results
+
+    buttons = []
+    for i, r in enumerate(results):
+        addr = r.get("display_name", "")[:60]
+        buttons.append([InlineKeyboardButton(f"{i+1}. {addr}", callback_data=str(i))])
+    buttons.append([InlineKeyboardButton("🔄 都唔係，重新搵", callback_data="retry")])
+
     await update.message.reply_text(
-        "喺邊度？\n"
-        "（地區或地址都得，例如：Kingsway Burnaby 或 Richmond）"
+        "係咪以下其中一間？",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
-    return WAITING_AREA
+    return WAITING_SELECTION
 
-async def get_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    area = update.message.text.strip()
-    if not area:
-        await update.message.reply_text("俾個地址我 😅")
-        return WAITING_AREA
+async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    name   = context.user_data['name']
+    if query.data == "retry":
+        await query.edit_message_text("好，再試吓。呢間叫咩名？")
+        return WAITING_NAME
+
+    idx = int(query.data)
+    place = context.user_data['places'][idx]
     ig_url = context.user_data['ig_url']
     uid    = context.user_data['user_id']
 
-    await update.message.reply_text("⏳ 搵緊地址...")
+    lat  = float(place["lat"])
+    lng  = float(place["lon"])
+    addr = place.get("display_name", "")
+    name = place.get("name") or addr.split(",")[0]
 
-    # Try progressively simpler queries
-    geo = None
-    queries = [
-        f"{name} {area}",           # Restaurant name + address
-        area,                        # Address only
-        f"{name} Vancouver BC",      # Name + city fallback
-    ]
-    for q in queries:
-        geo = await geocode(q)
-        if geo:
-            break
+    try:
+        supabase.table("restaurants").insert({
+            "user_id": uid,
+            "name":    name,
+            "area":    addr,
+            "ig_url":  ig_url,
+            "lat":     lat,
+            "lng":     lng,
+        }).execute()
 
-    if geo:
-        lat, lng, formatted = geo
-        try:
-            supabase.table("restaurants").insert({
-                "user_id": uid,
-                "name":    name,
-                "area":    area,
-                "ig_url":  ig_url,
-                "lat":     lat,
-                "lng":     lng,
-            }).execute()
-
-            await update.message.reply_text(
-                f"✅ 已加落食圖！\n\n"
-                f"🍽 {name}\n"
-                f"📍 {formatted}\n\n"
-                f"繼續 forward 下一條片！"
-            )
-        except Exception as e:
-            await update.message.reply_text("⚠️ 儲存失敗，請再試一次。")
-            print(f"Supabase error: {e}")
-    else:
-        await update.message.reply_text(
-            f"🤔 搵唔到位置。\n"
-            f"試吓只入地區名，例如：Burnaby 或 Kingsway"
+        await query.edit_message_text(
+            f"✅ 已加落食圖！\n\n"
+            f"🍽 {name}\n"
+            f"📍 {addr[:80]}\n\n"
+            f"繼續 forward 下一條片！"
         )
-        return WAITING_AREA
+    except Exception as e:
+        await query.edit_message_text("⚠️ 儲存失敗，請再試一次。")
+        print(f"Supabase error: {e}")
 
     return ConversationHandler.END
 
@@ -143,7 +144,7 @@ def main():
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)],
         states={
             WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            WAITING_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_area)],
+            WAITING_SELECTION: [CallbackQueryHandler(handle_selection)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
