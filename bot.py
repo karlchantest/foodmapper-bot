@@ -25,12 +25,14 @@ def extract_ig_url(text: str):
     match = re.search(pattern, text)
     return match.group(0) if match else None
 
-async def geocode(address: str):
+async def geocode(query: str):
+    """Returns (lat, lng, formatted_address) or None."""
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": address, "key": GOOGLE_API_KEY}
+    params = {"address": query, "key": GOOGLE_API_KEY}
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, params=params)
         data = resp.json()
+    print(f"Geocode query: {query} | status: {data.get('status')}")
     if data.get("status") == "OK":
         result = data["results"][0]
         loc = result["geometry"]["location"]
@@ -71,7 +73,7 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['name'] = name
     await update.message.reply_text(
         "喺邊度？\n"
-        "（可以係地址或地區，例如：3778 Grandview Hwy Burnaby 或 Richmond）"
+        "（地區或地址都得，例如：Kingsway Burnaby 或 Richmond）"
     )
     return WAITING_AREA
 
@@ -86,10 +88,18 @@ async def get_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid    = context.user_data['user_id']
 
     await update.message.reply_text("⏳ 搵緊地址...")
-    geo = await geocode(f"{name} {area} Vancouver")
 
-    if not geo:
-        geo = await geocode(f"{area} Vancouver")
+    # Try progressively simpler queries
+    geo = None
+    queries = [
+        f"{name} {area}",           # Restaurant name + address
+        area,                        # Address only
+        f"{name} Vancouver BC",      # Name + city fallback
+    ]
+    for q in queries:
+        geo = await geocode(q)
+        if geo:
+            break
 
     if geo:
         lat, lng, formatted = geo
@@ -114,8 +124,8 @@ async def get_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Supabase error: {e}")
     else:
         await update.message.reply_text(
-            f"🤔 搵唔到「{area}」嘅位置。\n"
-            f"可唔可以講詳細啲，例如完整地址？"
+            f"🤔 搵唔到位置。\n"
+            f"試吓只入地區名，例如：Burnaby 或 Kingsway"
         )
         return WAITING_AREA
 
