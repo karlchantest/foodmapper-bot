@@ -102,8 +102,15 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['search_name'] = name
 
     if not results:
-        await update.message.reply_text("🤔 搵唔到，試吓用英文或改吓名。")
-        return WAITING_NAME
+        buttons = [
+            [InlineKeyboardButton("🔄 試吓改名再搵", callback_data="retry")],
+            [InlineKeyboardButton("📢 通知 Admin 加入", callback_data="report")],
+        ]
+        await update.message.reply_text(
+            "🤔 搵唔到呢間餐廳。",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return WAITING_SELECTION
 
     context.user_data['places'] = results
     buttons = []
